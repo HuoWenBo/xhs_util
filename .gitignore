@@ -1,0 +1,15 @@
+/output
+/.idea
+/venv
+
+*.xlsx
+*.txt
+*.ipynb
+*.jsonl
+*.zip
+test.*
+t
+*.pyc
+
+models/models1
+models/models2
