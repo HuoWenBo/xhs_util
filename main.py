@@ -59,7 +59,7 @@ async def main(
     from lib.model import Model
     columns: List[str] = df.columns.tolist()
     datas: DataFrame = DataFrame(
-        columns=columns.extend([
+        columns=columns + [
             '一级',
             '二级',
             '职业',
@@ -69,7 +69,7 @@ async def main(
             '平均评论',
             '分享总数',
             '平均分享',
-        ])
+        ]
     )
 
     init_javascript = load_javascript_template('./lib/init.js')
@@ -208,7 +208,7 @@ async def main(
                 datas.loc[index, 'ID'] = number
                 datas.loc[index, '一级'] = labels.get('一级')
                 datas.loc[index, '二级'] = '、'.join(labels.get('二级'))
-                datas.loc[index, '二级'] = labels.get('职业')
+                datas.loc[index, '职业'] = labels.get('职业')
 
                 datas.loc[index, '点赞总数'] = liked_count
                 datas.loc[index, '平均点赞'] = avg_liked_count
@@ -219,6 +219,11 @@ async def main(
 
                 index += 1
 
+                try:
+                    datas.to_excel('./output/temp_file.xlsx', index=False)
+                except IOError:
+                    pass
+
                 data = {
                     'nickname': nickname,
                     'link': link,
@@ -228,14 +233,14 @@ async def main(
                     'labels': labels,
                     'titles': notes_title,
                 }
-                datas.to_excel('./output/temp_file.xlsx', index=False)
-
                 await chat_data.write(json.dumps(data, ensure_ascii=False))
                 await chat_data.write('\n')
     except Exception as e:
-        from datetime import datetime
         if not isinstance(e, (Error, TimeoutError, KeyboardInterrupt)):
             logger.error(e)
+    finally:
+        from datetime import datetime
+
         filename: str = datetime.now().strftime('%Y-%m-%d.%H-%M-%S')
         logger.warning(f'文件保存路径: ./output/{filename}.xlsx')
         datas.to_excel(f'./output/{filename}.xlsx', index=False)
