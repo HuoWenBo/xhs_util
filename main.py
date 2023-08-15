@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Union, Optional
 import emoji as emoji
 import typer
 from aiofile import async_open
+from jsonpath import JSONPath
 from loguru import logger
 from pandas import DataFrame, read_excel
 from playwright.async_api import (
@@ -58,7 +59,17 @@ async def main(
     from lib.model import Model
     columns: List[str] = df.columns.tolist()
     datas: DataFrame = DataFrame(
-        columns=columns + ['一级', '二级', '职业']
+        columns=columns.extend([
+            '一级',
+            '二级',
+            '职业',
+            '点赞总数',
+            '平均点赞',
+            '评论总数',
+            '平均评论',
+            '分享总数',
+            '平均分享',
+        ])
     )
 
     init_javascript = load_javascript_template('./lib/init.js')
@@ -66,6 +77,7 @@ async def main(
     javascript_template = load_javascript_template('./lib/inject_script.js')
 
     model = Model()
+
     try:
         async with (
             async_playwright() as playwright,
@@ -91,29 +103,48 @@ async def main(
             javascript_template = await javascript_template
 
             for i in range(start_row, end_row):
-                if (link := df['主页链接'][i]) and not link.startswith('https://www.xiaohongshu.com/user/profile/'):
+                if (link := df['主页链接'][i].strip()) and not link.startswith(
+                        'https://www.xiaohongshu.com/user/profile/'):
                     logger.error(f'不是小红书主页链接或链接有其他字符 {link}')
                     continue
                 await page.goto(link)
-                notes: List[Dict[str, Any]] = await page.evaluate(
-                    '() => __INITIAL_STATE__.user.notes._rawValue[0]'
+                initial_state: Dict[str, Any] = json.loads(
+                    (await page.locator('body > script:nth-child(4)').text_content())[25:]
+                    .replace('undefined', 'null')
                 )
-                if not notes:
+                if not initial_state:
                     logger.warning(f'用户不存在或被禁言或无笔记')
                     continue
-                titles: List[str] = list(map(
-                    lambda _note: emoji.replace_emoji(_note.get('noteCard').get('title'), replace='').replace(' ', ''),
-                    notes
-                ))
-                note_desc: List[str] = list(map(
-                    lambda _note: emoji.replace_emoji(_note.get('noteCard').get('desc'), replace='').replace(' ', ''),
-                    notes
-                ))
-                note_tags: List[List[str]] = list(map(
-                    lambda _note: [tag['name'] for tag in _note.get('noteCard').get('tagList')
-                                   if tag['type'] == 'topic'],
-                    notes
-                ))
+
+                notes: List[Dict[str, Union[str, List[Dict[str, str]]]]] = [note for note in JSONPath(
+                    '$.user.notes[0].*.noteCard.(title,desc,tagList,'
+                    'interactInfo.(sticky,collectedCount,commentCount,likedCount,shareCount))'
+                ).parse(initial_state) if note.get('interactInfo', {}).get('sticky', False) is False][:20]
+
+                if not notes:
+                    logger.warning(f'笔记为空')
+                    continue
+
+                notes_title: List[str] = []
+                notes_desc: List[str] = []
+                notes_tags: List[List[str]] = []
+                liked_count: int = 0
+                comment_count: int = 0
+                share_count: int = 0
+
+                for note in notes:
+                    notes_title.append(emoji.replace_emoji(note.get('title', ''), replace='').replace(' ', ''))
+                    notes_desc.append(emoji.replace_emoji(note.get('desc', ''), replace='').replace(' ', ''))
+                    notes_tags.append([tag['name'] for tag in note.get('tagList', []) if tag['type'] == 'topic'])
+
+                    liked_count += int(note.get('interactInfo', {}).get('likedCount', 0))
+                    comment_count += int(note.get('interactInfo', {}).get('commentCount', 0))
+                    share_count += int(note.get('interactInfo', {}).get('shareCount', 0))
+
+                avg_liked_count: float = liked_count / (notes_length := len(notes))
+                avg_comment_count: float = comment_count / notes_length
+                avg_share_count: float = share_count / notes_length
+
                 try:
                     user_info = page.locator('div.info')
                     nickname = await user_info.locator(
@@ -121,18 +152,18 @@ async def main(
                     ).text_content()
                     number = (await user_info.locator('span.user-redId').text_content())[5:]
                     try:
-                        desc = await user_info.locator('div.user-desc').text_content(timeout=100)
+                        user_desc = await user_info.locator('div.user-desc').text_content(timeout=100)
                     except TimeoutError:
-                        desc = ''
+                        user_desc = ''
                 except TimeoutError as e:
                     logger.error(e)
                     continue
-                logger.info(f'开始预测 {nickname} 博主类型')
+                logger.info(f'Excel 行号: {i + 2}, 开始预测 {nickname} 博主类型')
                 # 将note_tags(双层列表)中的标签加入prompt中
-                text = desc if desc else ''
+                text = user_desc or ''
                 for _ in range(len(notes)):
-                    text += titles[_] + note_desc[_] + ''.join(note_tags[_])
-                tags, profession = model.get_all_tags(text, desc)
+                    text += notes_title[_] + notes_desc[_] + ''.join(notes_tags[_])
+                tags, profession = model.get_all_tags(text, user_desc)
                 user_type: str = ''
                 for main_type in MAIN_TYPES:
                     if main_type in tags:
@@ -161,12 +192,15 @@ async def main(
                             )
                         )
                     try:
-                        label = await page.locator('#user-tag-data').text_content(timeout=1000)
+                        await asyncio.sleep(0.1)
+                        label = await page.locator('#user-tag-data').text_content(timeout=100)
                         break
                     except TimeoutError:
                         continue
+
                 if label:
                     labels = json.loads(label)
+
                 for column in columns:
                     datas.loc[index, column] = df[column][i]
 
@@ -176,16 +210,23 @@ async def main(
                 datas.loc[index, '二级'] = '、'.join(labels.get('二级'))
                 datas.loc[index, '二级'] = labels.get('职业')
 
+                datas.loc[index, '点赞总数'] = liked_count
+                datas.loc[index, '平均点赞'] = avg_liked_count
+                datas.loc[index, '评论总数'] = comment_count
+                datas.loc[index, '平均评论'] = avg_comment_count
+                datas.loc[index, '分享总数'] = share_count
+                datas.loc[index, '平均分享'] = avg_share_count
+
                 index += 1
 
                 data = {
                     'nickname': nickname,
                     'link': link,
-                    'desc': desc,
-                    'note_desc': note_desc,
-                    'note_tags': note_tags,
+                    'desc': user_desc,
+                    'note_desc': notes_desc,
+                    'note_tags': notes_tags,
                     'labels': labels,
-                    'titles': titles,
+                    'titles': notes_title,
                 }
                 datas.to_excel('./output/temp_file.xlsx', index=False)
 
